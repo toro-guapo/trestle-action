@@ -1,0 +1,46 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan-self:
+    name: Scan on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        id: trestle
+      - shell: bash
+        run: |
+          set -euo pipefail
+          echo "exit-code: ${{ steps.trestle.outputs.exit-code }}"
+          echo "has-findings: ${{ steps.trestle.outputs.has-findings }}"
+          test "${{ steps.trestle.outputs.exit-code }}" = "0"
+          test "${{ steps.trestle.outputs.has-findings }}" = "false"
+
+  sarif-output:
+    name: SARIF output is produced
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          args: --output-format=sarif --output-file=trestle.sarif
+      - shell: bash
+        run: |
+          set -euo pipefail
+          test -s trestle.sarif
+          head -c 200 trestle.sarif

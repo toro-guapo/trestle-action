@@ -1,0 +1,144 @@
+name: 'Trestle secret scanner'
+description: 'Scan source code for leaked secrets (API keys, tokens, private keys, certificates).'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'Trestle Community version to use, such as "1.2.3", or "latest" for the most recent release.'
+    required: false
+    default: 'latest'
+  path:
+    description: 'Path to scan. Defaults to the current directory (the repository root).'
+    required: false
+    default: '.'
+  args:
+    description: 'Extra arguments passed to "trestle scan". Space-separated; values cannot contain spaces.'
+    required: false
+    default: ''
+  fail-on-findings:
+    description: 'When true (default), fail the job if any secrets are found. Set to "false" to report findings without failing.'
+    required: false
+    default: 'true'
+  repository:
+    description: 'GitHub repository to download trestle from. Defaults to the official toro-guapo/trestle releases.'
+    required: false
+    default: 'toro-guapo/trestle'
+
+outputs:
+  exit-code:
+    description: 'Raw trestle exit code: 0 (no findings), 1 (findings), or 2 (error).'
+    value: ${{ steps.scan.outputs.exit-code }}
+  has-findings:
+    description: '"true" if trestle reported any findings, otherwise "false".'
+    value: ${{ steps.scan.outputs.has-findings }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        TRESTLE_INPUT_VERSION: ${{ inputs.version }}
+        TRESTLE_INPUT_PATH: ${{ inputs.path }}
+        TRESTLE_INPUT_ARGS: ${{ inputs.args }}
+        TRESTLE_INPUT_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        TRESTLE_INPUT_REPOSITORY: ${{ inputs.repository }}
+        TRESTLE_RUNNER_OS: ${{ runner.os }}
+        TRESTLE_RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+
+        repo="$TRESTLE_INPUT_REPOSITORY"
+        version="$TRESTLE_INPUT_VERSION"
+
+        if [ -z "$version" ] || [ "$version" = "latest" ]; then
+          latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest")"
+          version="${latest_url##*/v}"
+          if [ -z "$version" ] || [ "$version" = "$latest_url" ]; then
+            echo "Error: could not resolve the latest trestle version from ${repo}." >&2
+            exit 2
+          fi
+        fi
+
+        version="${version#v}"
+
+        case "${TRESTLE_RUNNER_OS}-${TRESTLE_RUNNER_ARCH}" in
+          Linux-X64)     platform="linux-x86-64"        ;;
+          Linux-ARM64)   platform="linux-arm64"         ;;
+          macOS-X64)     platform="macos-intel"         ;;
+          macOS-ARM64)   platform="macos-apple-silicon" ;;
+          Windows-X64)   platform="windows-x86-64.exe"  ;;
+          Windows-ARM64) platform="windows-arm64.exe"   ;;
+          *)
+            echo "Error: unsupported runner ${TRESTLE_RUNNER_OS}-${TRESTLE_RUNNER_ARCH}." >&2
+            echo "Trestle ships binaries for Linux, macOS, and Windows on x86-64 and arm64." >&2
+            exit 2
+            ;;
+        esac
+
+        binary_name="trestle-community-${version}-${platform}"
+        download_base="https://github.com/${repo}/releases/download/v${version}"
+
+        workdir="${RUNNER_TEMP:-/tmp}/trestle-action-${version}"
+        mkdir -p "$workdir"
+        binary_path="${workdir}/${binary_name}"
+        checksums_path="${workdir}/checksums.txt"
+
+        echo "Downloading ${binary_name} from ${download_base}..."
+        if ! curl -fsSL -o "$binary_path" "${download_base}/${binary_name}"; then
+          echo "Error: failed to download ${binary_name} from release v${version}." >&2
+          exit 2
+        fi
+        if ! curl -fsSL -o "$checksums_path" "${download_base}/checksums.txt"; then
+          echo "Error: failed to download checksums.txt from release v${version}." >&2
+          exit 2
+        fi
+
+        expected_hash="$(awk -v name="$binary_name" '$2 == name || $2 == "*" name { print $1; exit }' "$checksums_path")"
+        if [ -z "$expected_hash" ]; then
+          echo "Error: ${binary_name} not listed in checksums.txt." >&2
+          exit 2
+        fi
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual_hash="$(cd "$workdir" && sha256sum "$binary_name" | awk '{ print $1 }')"
+        elif command -v shasum >/dev/null 2>&1; then
+          actual_hash="$(cd "$workdir" && shasum -a 256 "$binary_name" | awk '{ print $1 }')"
+        else
+          echo "Error: could not verify the binary checksum." >&2
+          exit 2
+        fi
+
+        if [ "$expected_hash" != "$actual_hash" ]; then
+          echo "Error: sha256 mismatch for ${binary_name}." >&2
+          echo "  expected: ${expected_hash}" >&2
+          echo "  actual:   ${actual_hash}" >&2
+          exit 2
+        fi
+
+        chmod +x "$binary_path"
+
+        set +e
+        # shellcheck disable=SC2086
+        "$binary_path" scan $TRESTLE_INPUT_ARGS "$TRESTLE_INPUT_PATH"
+        exit_code=$?
+        set -e
+
+        echo "exit-code=${exit_code}" >> "$GITHUB_OUTPUT"
+        if [ "$exit_code" -eq 1 ]; then
+          echo "has-findings=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has-findings=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        if [ "$exit_code" -eq 2 ]; then
+          exit 2
+        fi
+
+        if [ "$exit_code" -eq 1 ] && [ "$TRESTLE_INPUT_FAIL_ON_FINDINGS" != "false" ]; then
+          exit 1
+        fi
+
+        exit 0
